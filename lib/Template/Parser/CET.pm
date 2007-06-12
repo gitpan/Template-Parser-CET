@@ -8,15 +8,15 @@ package Template::Parser::CET;
 use vars qw($VERSION $TEMP_VARNAME $ORIG_CONFIG_CLASS $NO_LOAD_EXTRA_VMETHODS);
 use strict;
 use warnings;
-use base qw(CGI::Ex::Template);
+use base qw(Template::Alloy);
 
-use CGI::Ex::Template 2.11;
-use CGI::Ex::Dump qw(debug dex_trace);
+use Template::Alloy 1.002;
+use Template::Alloy::Operator qw($OP_ASSIGN $OP_DISPATCH);
 use Template::Directive;
 use Template::Constants;
 
 BEGIN {
-    $VERSION = '0.02';
+    $VERSION = '0.04';
 
     $TEMP_VARNAME = 'template_parser_cet_temp_varname';
 };
@@ -83,6 +83,8 @@ sub parse {
     my ($self, $text, $info) = @_;
     my ($tokens, $block);
 
+    eval { require Template::Stash };
+    local $Template::Alloy::QR_PRIVATE = $Template::Stash::PRIVATE;
     local $self->{'_debug'}     = defined($info->{'DEBUG'}) ? $info->{'DEBUG'} : $self->{'DEBUG_DIRS'} || undef;
     local $self->{'DEFBLOCK'}   = {};
     local $self->{'METADATA'}   = [];
@@ -359,8 +361,6 @@ sub compile_operator {
 
     $op = ($op eq 'mod') ? '%'
         : ($op eq 'pow') ? '**'
-        : ($op eq '==' ) ? 'eq'
-        : ($op eq '!=' ) ? 'ne'
         :                  $op;
 
     if ($op eq '{}') {
@@ -379,13 +379,6 @@ sub compile_operator {
         return "(''.". join(".\n    ", map { $self->compile_expr($_) } @the_rest).")";
     } elsif ($op eq '=') {
         return $self->compile_expr($the_rest[0], $self->compile_expr($the_rest[1]));
-
-    # handle assignment operators
-    } elsif ($CGI::Ex::Template::OP_ASSIGN->{$op}) {
-        $op =~ /^([^\w\s\$]+)=$/ || die "Not sure how to handle that op $op";
-        my $short = ($1 eq '_' || $1 eq '~') ? '.' : $1;
-        return $self->compile_expr($the_rest[0], "do { no warnings; "
-                                   .$self->compile_expr($the_rest[0]) ." $short ". $self->compile_expr($the_rest[1]) ."; }");
 
     } elsif ($op eq '++') {
         my $is_postfix = $the_rest[1] || 0; # set to 1 during postfix
@@ -415,6 +408,8 @@ sub compile_operator {
 
     } elsif (@the_rest == 1) {
         return $op.$self->compile_expr($the_rest[0]);
+    } elsif ($op eq '//' || $op eq 'err') {
+        return "do { my \$var = ".$self->compile_expr($the_rest[0])."; defined(\$var) ? \$var : ".$self->compile_expr($the_rest[1])."}";
     } else {
         return "do { no warnings; ".$self->compile_expr($the_rest[0])." $op ".$self->compile_expr($the_rest[1])."}";
     }
@@ -465,6 +460,8 @@ sub compile_CLEAR {
     my $self = shift;
     return $self->{'FACTORY'}->clear;
 }
+
+sub compile_COMMENT {}
 
 sub compile_CONFIG {
     my ($self, $config) = @_;
@@ -569,11 +566,26 @@ EOF
 
 sub compile_END { '' }
 
+sub compile_EVAL {
+    my ($self, $ref, $node) = @_;
+    my ($named, @strs) = @$ref;
+
+    $named = [[]]; # TT doesn't allow args to eval ! $named ? [[]] : [[], map { $self->compile_expr($_) } @$named];
+
+    my $block = "
+    foreach my \$str (".join(",\n", map {$self->compile_expr($_)} @strs).") {
+        next if ! defined \$str;
+        \$output .= \$str; # Alloy does them one at a time
+    }";
+
+    $self->{'FACTORY'}->filter([["'eval'"], $named, ''], $block);
+}
+
 sub compile_FILTER {
     my ($self, $ref, $node) = @_;
     my ($alias, $filter) = @$ref;
 
-    my ($filt_name, $args) = @$filter; # doesn't support CGI::Ex::Template chained filters
+    my ($filt_name, $args) = @$filter; # doesn't support Template::Alloy chained filters
 
     $args = ! $args ? [[]] : [[], map { $self->compile_expr($_) } @$args];
 
@@ -655,8 +667,41 @@ sub compile_LAST {
     return "last;\n";
 }
 
+sub compile_LOOP {
+    my ($self, $ref, $node) = @_;
+    $ref = [$ref, 0] if ! ref $ref;
+
+    my $out = "do {
+    my \$out_ref = \\\$output;
+    my \$conf = \$context->{'CONFIG'} ||= {};
+    my \$var = ".$self->compile_expr($ref).";
+    if (\$var) {
+        my \$global = ! \$conf->{'SYNTAX'} || \$conf->{'SYNTAX'} ne 'ht' || \$conf->{'GLOBAL_VARS'};
+        my \$items  = ref(\$var) eq 'ARRAY' ? \$var : ref(\$var) eq 'HASH' ? [\$var] : [];
+        my \$i = 0;
+        for my \$ref (\@\$items) {
+            \$context->throw('loop', 'Scalar value used in LOOP') if \$ref && ref(\$ref) ne 'HASH';
+            my \$stash = \$global ? \$stash : ref(\$stash)->new;
+            \$stash = \$context->localise() if \$global;
+            if (\$conf->{'LOOP_CONTEXT_VARS'} && ! \$Template::Stash::PRIVATE) {
+                my \%set;
+                \@set{qw(__counter__ __first__ __last__ __inner__ __odd__)}
+                    = (++\$i, (\$i == 1 ? 1 : 0), (\$i == \@\$items ? 1 : 0), (\$i == 1 || \$i == \@\$items ? 0 : 1), (\$i % 2) ? 1 : 0);
+                \$stash->set(\$_, \$set{\$_}) foreach keys %set;
+            }
+            if (ref(\$ref) eq 'HASH') {
+                \$stash->set(\$_, \$ref->{\$_}) foreach keys %\$ref;
+            }
+".$self->compile_tree($node->[4])."
+            \$stash = \$context->delocalise() if \$global;
+        }
+    }
+};";
+    return $out;
+}
+
 sub compile_MACRO {
-    my ($self, $ref, $node, $out_ref) = @_;
+    my ($self, $ref, $node) = @_;
     my ($name, $args) = @$ref;
 
     $name = $self->compile_ident_str_from_cet($name);
@@ -667,7 +712,7 @@ sub compile_MACRO {
     if (! $sub_tree || ! $sub_tree->[0]) {
         $self->set_variable($name, undef);
         return;
-    } elsif ($sub_tree->[0]->[0] eq 'BLOCK') {
+    } elsif (ref($sub_tree->[0]) && $sub_tree->[0]->[0] eq 'BLOCK') {
         $sub_tree = $sub_tree->[0]->[4];
     }
 
@@ -749,7 +794,7 @@ sub compile_SET {
             $val = $self->compile_expr($val);
         }
 
-        if ($CGI::Ex::Template::OP_DISPATCH->{$op}) {
+        if ($OP_DISPATCH->{$op}) {
             $op =~ /^([^\w\s\$]+)=$/ || die "Not sure how to handle that op $op during SET";
             my $short = ($1 eq '_' || $1 eq '~') ? '.' : $1;
             $val = "do { no warnings;\n". $self->compile_expr($set) ." $short $val}";
@@ -886,22 +931,34 @@ sub compile_WRAPPER {
 if (! $NO_LOAD_EXTRA_VMETHODS
     && eval {require Template::Stash}) {
 
-    for my $meth (qw(0 int fmt rand)) {
+    for my $meth (qw(0 abs atan2 cos exp hex int fmt lc log oct rand sin sprintf sqrt uc)) {
         next if defined $Template::Stash::SCALAR_OPS{$meth};
-        Template::Stash->define_vmethod('scalar', $meth => $CGI::Ex::Template::SCALAR_OPS->{$meth});
+        Template::Stash->define_vmethod('scalar', $meth => $Template::Alloy::SCALAR_OPS->{$meth});
     }
 
     for my $meth (qw(fmt pick)) {
         next if defined $Template::Stash::LIST_OPS{$meth};
-        Template::Stash->define_vmethod('list', $meth => $CGI::Ex::Template::LIST_OPS->{$meth});
+        Template::Stash->define_vmethod('list', $meth => $Template::Alloy::LIST_OPS->{$meth});
     }
 
     for my $meth (qw(fmt)) {
         next if defined $Template::Stash::HASH_OPS{$meth};
-        Template::Stash->define_vmethod('hash', $meth => $CGI::Ex::Template::HASH_OPS->{$meth});
+        Template::Stash->define_vmethod('hash', $meth => $Template::Alloy::HASH_OPS->{$meth});
     }
 }
 
+sub add_top_level_functions {
+    my ($class, $hash) = @_;
+    eval {require Template::Stash};
+    foreach (keys %{ $Template::Stash::SCALAR_OPS }) {
+        next if defined $hash->{$_};
+        $hash->{$_} = $Template::Stash::SCALAR_OPS->{$_};
+    }
+    foreach (keys %{ $Template::Alloy::VOBJS }) {
+        next if defined $hash->{$_};
+        $hash->{$_} = $Template::Alloy::VOBJS->{$_};
+    }
+}
 
 ###----------------------------------------------------------------###
 ### handle the playing of the DUMP directive since it the patch wasn't accepted
@@ -975,7 +1032,7 @@ __END__
 
 =head1 NAME
 
-Template::Parser::CET - CGI::Ex::Template based parser for the TT2 engine
+Template::Parser::CET - Template::Alloy based parser for the TT2 engine
 
 =head1 SYNOPSIS
 
@@ -983,7 +1040,7 @@ Template::Parser::CET - CGI::Ex::Template based parser for the TT2 engine
     use Template::Parser::CET;
 
     my $t = Template->new(
-        PARSER => Template::Parser->new
+        PARSER => Template::Parser::CET->new
     );
 
 
@@ -1006,14 +1063,14 @@ Template::Parser::CET - CGI::Ex::Template based parser for the TT2 engine
 Template::Parser::CET provides much or most of the TT3 syntax and runs
 on the current TT2 engine.
 
-CGI::Ex::Template (CET) provides a fast implementation of TT2 and TT3.
-There are some cases where Template::Toolkit is faster.  There are
-also some cases where shops have custom providers, or custom stashes
-that require the use of the current TT2 engine.  In these cases,
-Template::Parser::CET provides the best of both worlds - offering TT2
-AND TT3 syntax and running on the existing platform making use of all
-of your current work (In many cases CET should be able to do this
-anyway).
+Template::Alloy which was formerly known as CGI::Ex::Template (CET)
+provides a fast implementation of TT2 and TT3.  There are some cases
+where Template::Toolkit is faster.  There are also some cases where
+shops have custom providers, or custom stashes that require the use of
+the current TT2 engine.  In these cases, Template::Parser::CET
+provides the best of both worlds - offering TT2 AND TT3 syntax and
+running on the existing platform making use of all of your current
+work (In many cases CET should be able to do this anyway).
 
 This module may eventually be made obsolete when the final real
 Template::Toolkit 3 engine by Andy Wardley is released.  But that
@@ -1025,7 +1082,7 @@ been little reported uptake.  The TT3 features/extended syntax
 are very compelling.  For various reasons people chose not to use CET.
 Now people can use TT2 and get the features of TT3 (through CET) today.
 
-Hopefully Template::Parser::CET and CGI::Ex::Template can be used in
+Hopefully Template::Parser::CET and Template::Alloy can be used in
 the same spirit as Pugs is used for Perl 6.  All of the code from
 CET and Template::Parser::CET are free for use in TT3.
 
@@ -1034,16 +1091,78 @@ CET and Template::Parser::CET are free for use in TT3.
 All speed is relative and varies tremendously depending upon the size
 and content of your template.
 
-Template::Parser::CET generally compiles documents at the same speed as
-Template::Parser and Template::Grammar. CGI::Ex::Template compiles
+Template::Parser::CET generally compiles documents a little faster
+than Template::Parser and Template::Grammar. Template::Alloy compiles
 documents to its AST (abastract syntax tree) very quickly, but
 Template::Paser::CET then has to emit a TT2 style compiled
-Template::Document perl document.  So even though CGI::Ex::Template
-has a speed advantage, the advantage is lost in Template::Parser::CET.
+Template::Document perl document.  So even though Template::Alloy has
+a speed advantage, the advantage is lost in Template::Parser::CET.
 
-If you use compiled in memory templates - they will execute as quickly as
-the normal TT2 documents.  In all other cases Template::Parser::CET
-will prepare the documents at about the same speed.
+If you use compiled in memory templates - they will execute as quickly
+as the normal TT2 documents.  In all other cases Template::Parser::CET
+will prepare the documents at about the same speed (usually a little
+faster).
+
+=head1 SYNTAXES
+
+Template::Alloy supports TT2 and TT3.  It also supports Text::Tmpl,
+Velocity (VTL), HTML::Template and HTML::Template::Expr.  It is now
+possible to run HTML::Template templates on your TT2 engine.
+
+Template::Alloy allows you to use any of the interfaces of any of the
+major template engines.  Template::Parser::CET, because it is used
+through Template, only supports the Template interface (perl calling
+methods).  However by setting the SYNTAX during startup, you can use
+templates from the other major engines.
+
+The L<Template::Alloy> documentation will have more examples of using
+different syntaxes.
+
+=head2 Template::Toolkit style usage (tt3)
+
+    use Template;
+    use Template::Parser::CET;
+    Template::Parser::CET->activate;
+
+    my $t = Template->new(SYNTAX => 'tt3');
+
+    # OR
+    my $t = Template->new(SYNTAX => 'tt2'); # syntax that is more TT2 friendly
+
+    $t->process(\"[% foo %]", {foo => 'bar'});
+
+=head2 HTML::Template::Expr style usage (hte)
+
+    use Template;
+    use Template::Parser::CET;
+    Template::Parser::CET->activate;
+
+    my $t = Template->new(SYNTAX => 'hte');
+
+    # or
+    my $t = Template->new(SYNTAX => 'ht'); # HTML::Template
+
+    $t->process(\"<TMPL_VAR NAME=foo>", {foo => 'bar'});
+
+=head2 Text::Tmpl style usage (tmpl)
+
+    use Template;
+    use Template::Parser::CET;
+    Template::Parser::CET->activate;
+
+    my $t = Template->new(SYNTAX => 'tmpl');
+
+    $t->process(\"[% echo $foo %]", {foo => 'bar'});
+
+=head2 Velocity (VTL) style usage
+
+    use Template;
+    use Template::Parser::CET;
+    Template::Parser::CET->activate;
+
+    my $t = Template->new(SYNTAX => 'velocity');
+
+    $t->process(\"#set($foo 1 + 3) ($foo)");
 
 =head1 FEATURES
 
@@ -1056,10 +1175,20 @@ are in addition to those provided natively by Template::Toolkit.
 
 =item Grammar
 
-CGI::Ex::Template provides Template::Parser::CET with a recursive
+Template::Alloy provides Template::Parser::CET with a recursive
 grammar.  This provides a range of benefits including speed, better
-error reporting, more consistent syntax, more possibilities for
+error reporting, more consistent syntax, and more possibilities for
 extending the grammar.
+
+=item Syntax
+
+As part of the grammar, Template::Parser::CET supports the SYNTAX
+configuration item which can be one of tt2 (Template::Toolkit v2), tt3
+(Template::Toolkit v3), ht (HTML::Template), hte
+(HTML::Template::Expr), tmpl (Text::Tmpl), or velocity (Velocity VTL).
+This means you can use any of your templates from any of the major
+mini-language based template engines and run them on your stock TT2
+engine.
 
 =item Numerical hash keys work
 
@@ -1314,14 +1443,14 @@ by using:
 
 =head1 DOCUMENTATION
 
-Template::Toolkit and CGI::Ex::Template already cover everything that
+Template::Toolkit and Template::Alloy already cover everything that
 would be covered here.  If you are running Template::Parser::CET then
-you already have both Template::Toolkit and CGI::Ex::Template installed.
+you already have both Template::Toolkit and Template::Alloy installed.
 Please refer to their documentation for complete configuration and
 syntax examples.
 
 For any of the items in the FEATURES section you will need to refer to
-the CGI::Ex::Template documentation.
+the Template::Alloy documentation.
 
 =head1 BUGS / TODO
 
@@ -1335,7 +1464,7 @@ such as inline filters, self modifying operators, pre and post decrement
 and increment, and CONFIG and DUMP directive support, the abstraction
 to Template::Directive was broken.  This means that projects such as
 Jemplate can't use these extended features directly (but projects such
-as Jemplate could write faster smaller templates if they used CGI::Ex::Template's
+as Jemplate could write faster smaller templates if they used Template::Alloy's
 compiled AST directly).
 
 =item
