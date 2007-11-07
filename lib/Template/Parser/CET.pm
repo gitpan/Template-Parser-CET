@@ -10,13 +10,13 @@ use strict;
 use warnings;
 use base qw(Template::Alloy);
 
-use Template::Alloy 1.002;
+use Template::Alloy 1.008;
 use Template::Alloy::Operator qw($OP_ASSIGN $OP_DISPATCH);
 use Template::Directive;
 use Template::Constants;
 
 BEGIN {
-    $VERSION = '0.04';
+    $VERSION = '0.05';
 
     $TEMP_VARNAME = 'template_parser_cet_temp_varname';
 };
@@ -672,10 +672,9 @@ sub compile_LOOP {
     $ref = [$ref, 0] if ! ref $ref;
 
     my $out = "do {
-    my \$out_ref = \\\$output;
-    my \$conf = \$context->{'CONFIG'} ||= {};
     my \$var = ".$self->compile_expr($ref).";
     if (\$var) {
+        my \$conf = \$context->{'CONFIG'} ||= {};
         my \$global = ! \$conf->{'SYNTAX'} || \$conf->{'SYNTAX'} ne 'ht' || \$conf->{'GLOBAL_VARS'};
         my \$items  = ref(\$var) eq 'ARRAY' ? \$var : ref(\$var) eq 'HASH' ? [\$var] : [];
         my \$i = 0;
@@ -931,7 +930,7 @@ sub compile_WRAPPER {
 if (! $NO_LOAD_EXTRA_VMETHODS
     && eval {require Template::Stash}) {
 
-    for my $meth (qw(0 abs atan2 cos exp hex int fmt lc log oct rand sin sprintf sqrt uc)) {
+    for my $meth (qw(0 abs atan2 cos exp fmt hex int js lc log oct rand sin sprintf sqrt uc)) {
         next if defined $Template::Stash::SCALAR_OPS{$meth};
         Template::Stash->define_vmethod('scalar', $meth => $Template::Alloy::SCALAR_OPS->{$meth});
     }
